@@ -1,0 +1,786 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+final class DopplerHubCliException extends RuntimeException
+{
+}
+
+final class DopplerHubHttpClient
+{
+    public function __construct(
+        private readonly string $apiKey,
+        private readonly string $baseUrl,
+        private readonly int $timeoutSeconds
+    ) {
+        if (!extension_loaded('curl')) {
+            throw new DopplrHubCliException('The cURL extension is required.');
+        }
+    }
+
+    public function uploadFile(string $filePath): array
+    {
+        $fileName = basename($filePath);
+        $mimeType = function_exists('mime_content_type')
+            ? (mime_content_type($filePath) ?: 'application/octet-stream')
+            : 'application/octet-stream';
+
+        return $this->requestJson('POST', '/upload', [
+            'multipart' => [
+                'file' => new CURLFile($filePath, $mimeType, $fileName),
+            ],
+        ]);
+    }
+
+    public function startConversion(array $upload, string $targetFormat, ?string $originalName = null): array
+    {
+        return $this->requestJson('POST', '/convert', [
+            'json' => [
+                'fileId' => $upload['fileId'] ?? null,
+                'inputKey' => $upload['inputKey'] ?? null,
+                'targetFormat' => $targetFormat,
+                'originalName' => $originalName ?? ($upload['fileName'] ?? 'input.bin'),
+            ],
+        ]);
+    }
+
+    public function startToolJob(string $endpoint, array $payload): array
+    {
+        return $this->requestJson('POST', $endpoint, ['json' => $payload]);
+    }
+
+    public function analyzeAda(array $upload, ?string $originalName = null, ?string $contentType = null): array
+    {
+        return $this->requestJson('POST', '/tools/ada/analyze', [
+            'json' => array_filter([
+                'fileId' => $upload['fileId'] ?? null,
+                'inputKey' => $upload['inputKey'] ?? null,
+                'originalName' => $originalName ?? ($upload['fileName'] ?? 'input.bin'),
+                'contentType' => $contentType,
+            ], static fn ($value) => $value !== null),
+        ]);
+    }
+
+    public function analyzeAts(
+        array $upload,
+        string $jobDescription,
+        ?string $originalName = null,
+        ?string $contentType = null,
+        ?string $industry = null,
+        ?string $templateId = null
+    ): array {
+        return $this->requestJson('POST', '/tools/ats/analyze', [
+            'json' => array_filter([
+                'fileId' => $upload['fileId'] ?? null,
+                'inputKey' => $upload['inputKey'] ?? null,
+                'originalName' => $originalName ?? ($upload['fileName'] ?? 'input.bin'),
+                'contentType' => $contentType,
+                'jobDescription' => $jobDescription,
+                'industry' => $industry,
+                'templateId' => $templateId,
+            ], static fn ($value) => $value !== null),
+        ]);
+    }
+
+    public function getJob(string $jobId): array
+    {
+        return $this->requestJson('GET', '/jobs/' . rawurlencode($jobId));
+    }
+
+    public function deleteJob(string $jobId): void
+    {
+        $this->requestJson('DELETE', '/jobs/' . rawurlencode($jobId));
+    }
+
+    public function downloadToFile(string $url, string $targetPath): void
+    {
+        $directory = dirname($targetPath);
+        if (!is_dir($directory) && !mkdir($directory, 0777, true) && !is_dir($directory)) {
+            throw new DopplrHubCliException('Could not create output directory: ' . $directory);
+        }
+
+        $stream = fopen($targetPath, 'wb');
+        if ($stream === false) {
+            throw new DopplrHubCliException('Could not open output file: ' . $targetPath);
+        }
+
+        $ch = curl_init($url);
+        if ($ch === false) {
+            fclose($stream);
+            throw new DopplrHubCliException('Could not initialize download request.');
+        }
+
+        curl_setopt_array($ch, [
+            CURLOPT_FILE => $stream,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_TIMEOUT => max($this->timeoutSeconds, 60),
+            CURLOPT_FAILONERROR => false,
+            CURLOPT_USERAGENT => 'dopplrhub-php-cli/0.1.0',
+        ]);
+
+        $result = curl_exec($ch);
+        $errno = curl_errno($ch);
+        $error = curl_error($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+        fclose($stream);
+
+        if ($result === false || $errno !== 0) {
+            @unlink($targetPath);
+            throw new DopplrHubCliException('Download failed: ' . $error);
+        }
+
+        if ($status >= 400) {
+            @unlink($targetPath);
+            throw new DopplrHubCliException('Download failed with HTTP ' . $status . '.');
+        }
+    }
+
+    private function requestJson(string $method, string $path, array $options = []): array
+    {
+        [$status, $headers, $body] = $this->request($method, $path, $options);
+        $decoded = json_decode($body, true);
+
+        if (!is_array($decoded)) {
+            throw new DopplrHubCliException(sprintf(
+                'Expected JSON response for %s %s, got: %s',
+                $method,
+                $path,
+                trim($body) === '' ? '[empty body]' : trim($body)
+            ));
+        }
+
+        if ($status >= 400) {
+            $message = is_string($decoded['error'] ?? null) ? $decoded['error'] : ('HTTP ' . $status);
+            throw new DopplrHubCliException($message);
+        }
+
+        return $decoded;
+    }
+
+    private function request(string $method, string $path, array $options = []): array
+    {
+        $url = $this->baseUrl . '/' . ltrim($path, '/');
+        $headers = [
+            'Accept: application/json',
+            'x-api-key: ' . $this->apiKey,
+        ];
+
+        $ch = curl_init($url);
+        if ($ch === false) {
+            throw new DopplrHubCliException('Could not initialize request.');
+        }
+
+        $responseHeaders = [];
+        curl_setopt_array($ch, [
+            CURLOPT_CUSTOMREQUEST => $method,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_TIMEOUT => $this->timeoutSeconds,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_HEADERFUNCTION => static function ($curl, string $headerLine) use (&$responseHeaders): int {
+                $length = strlen($headerLine);
+                $parts = explode(':', $headerLine, 2);
+                if (count($parts) === 2) {
+                    $responseHeaders[strtolower(trim($parts[0]))] = trim($parts[1]);
+                }
+                return $length;
+            },
+            CURLOPT_USERAGENT => 'dopplrhub-php-cli/0.1.0',
+        ]);
+
+        if (isset($options['json'])) {
+            $payload = json_encode($options['json'], JSON_THROW_ON_ERROR);
+            $headers[] = 'Content-Type: application/json';
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+        }
+
+        if (isset($options['multipart'])) {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $options['multipart']);
+        }
+
+        $body = curl_exec($ch);
+        $errno = curl_errno($ch);
+        $error = curl_error($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        curl_close($ch);
+
+        if ($body === false || $errno !== 0) {
+            throw new DopplrHubCliException('Request failed: ' . $error);
+        }
+
+        return [$status, $responseHeaders, $body];
+    }
+}
+
+final class DopplrHubCliApp
+{
+    public function run(array $argv): int
+    {
+        try {
+            $config = $this->parseArguments($argv);
+            $client = new DopplrHubHttpClient(
+                $config['apiKey'],
+                $config['baseUrl'],
+                $config['timeoutSeconds']
+            );
+
+            $failures = 0;
+            if ($config['tool'] === 'pdf' && $config['operation'] === 'merge') {
+                try {
+                    $this->pdfMerge($client, $config);
+                } catch (Throwable $e) {
+                    $failures++;
+                    fwrite(STDERR, sprintf("[error] pdf merge: %s\n", $e->getMessage()));
+                }
+            } else {
+                foreach ($config['inputs'] as $inputPath) {
+                    try {
+                        $this->processOne($client, $inputPath, $config);
+                    } catch (Throwable $e) {
+                        $failures++;
+                        fwrite(STDERR, sprintf("[error] %s: %s\n", $inputPath, $e->getMessage()));
+                    }
+                }
+            }
+
+            return $failures === 0 ? 0 : 1;
+        } catch (Throwable $e) {
+            fwrite(STDERR, $e->getMessage() . PHP_EOL);
+            return 1;
+        }
+    }
+
+    private function processOne(DopplrHubHttpClient $client, string $inputPath, array $config): void
+    {
+        switch ($config['tool']) {
+            case 'convert':
+                $this->convertOne($client, $inputPath, $config);
+                return;
+            case 'ocr':
+                $this->ocrOne($client, $inputPath, $config);
+                return;
+            case 'pdf':
+                $this->pdfOne($client, $inputPath, $config);
+                return;
+            case 'image':
+                $this->imageOne($client, $inputPath, $config);
+                return;
+            case 'video':
+                $this->videoOne($client, $inputPath, $config);
+                return;
+            case 'ada':
+                $this->adaOne($client, $inputPath, $config);
+                return;
+            case 'ats':
+                $this->atsOne($client, $inputPath, $config);
+                return;
+            default:
+                throw new DopplrHubCliException('Unsupported tool: ' . $config['tool']);
+        }
+    }
+
+    private function convertOne(DopplrHubHttpClient $client, string $inputPath, array $config): void
+    {
+        $resolved = realpath($inputPath);
+        if ($resolved === false || !is_file($resolved)) {
+            throw new DopplrHubCliException('Input file not found.');
+        }
+
+        fwrite(STDOUT, sprintf("[upload] %s\n", $resolved));
+        $upload = $client->uploadFile($resolved);
+
+        fwrite(STDOUT, sprintf("[queue]  %s -> %s\n", basename($resolved), $config['targetFormat']));
+        $job = $client->startConversion($upload, $config['targetFormat'], basename($resolved));
+        $this->downloadCompletedJob($client, $resolved, $config, $job);
+    }
+
+    private function ocrOne(DopplrHubHttpClient $client, string $inputPath, array $config): void
+    {
+        $resolved = $this->resolveInputPath($inputPath);
+        fwrite(STDOUT, sprintf("[upload] %s\n", $resolved));
+        $upload = $client->uploadFile($resolved);
+
+        fwrite(STDOUT, sprintf("[queue]  %s -> %s\n", basename($resolved), $config['targetFormat']));
+        $job = $client->startToolJob('/tools/ocr', [
+            'fileId' => $upload['fileId'] ?? null,
+            'inputKey' => $upload['inputKey'] ?? null,
+            'targetFormat' => $config['targetFormat'],
+            'originalName' => basename($resolved),
+            'language' => $config['language'],
+        ]);
+        $this->downloadCompletedJob($client, $resolved, $config, $job);
+    }
+
+    private function pdfOne(DopplrHubHttpClient $client, string $inputPath, array $config): void
+    {
+        $resolved = $this->resolveInputPath($inputPath);
+        fwrite(STDOUT, sprintf("[upload] %s\n", $resolved));
+        $upload = $client->uploadFile($resolved);
+
+        fwrite(STDOUT, sprintf("[queue]  %s -> pdf/%s\n", basename($resolved), $config['operation']));
+        $job = $client->startToolJob('/tools/pdf', [
+            'operation' => $config['operation'],
+            'fileId' => $upload['fileId'] ?? null,
+            'inputKey' => $upload['inputKey'] ?? null,
+            'originalName' => basename($resolved),
+            'params' => $config['params'],
+        ]);
+        $this->downloadCompletedJob($client, $resolved, $config, $job);
+    }
+
+    private function pdfMerge(DopplrHubHttpClient $client, array $config): void
+    {
+        $uploads = [];
+        $resolvedInputs = [];
+
+        foreach ($config['inputs'] as $inputPath) {
+            $resolved = $this->resolveInputPath($inputPath);
+            $resolvedInputs[] = $resolved;
+            fwrite(STDOUT, sprintf("[upload] %s\n", $resolved));
+            $uploads[] = $client->uploadFile($resolved);
+        }
+
+        fwrite(STDOUT, sprintf("[queue]  %d files -> pdf/merge\n", count($uploads)));
+        $job = $client->startToolJob('/tools/pdf', [
+            'operation' => 'merge',
+            'fileId' => $uploads[0]['fileId'] ?? null,
+            'inputKey' => $uploads[0]['inputKey'] ?? null,
+            'inputKeys' => array_map(static fn (array $upload) => $upload['inputKey'] ?? null, $uploads),
+            'originalName' => basename($resolvedInputs[0]),
+            'params' => $config['params'],
+        ]);
+        $this->downloadCompletedJob($client, $resolvedInputs[0], $config, $job);
+    }
+
+    private function imageOne(DopplrHubHttpClient $client, string $inputPath, array $config): void
+    {
+        $resolved = $this->resolveInputPath($inputPath);
+        fwrite(STDOUT, sprintf("[upload] %s\n", $resolved));
+        $upload = $client->uploadFile($resolved);
+
+        fwrite(STDOUT, sprintf("[queue]  %s -> image/%s\n", basename($resolved), $config['operation']));
+        $job = $client->startToolJob('/tools/image', [
+            'operation' => $config['operation'],
+            'fileId' => $upload['fileId'] ?? null,
+            'inputKey' => $upload['inputKey'] ?? null,
+            'originalName' => basename($resolved),
+            'params' => $config['params'],
+        ]);
+        $this->downloadCompletedJob($client, $resolved, $config, $job);
+    }
+
+    private function videoOne(DopplrHubHttpClient $client, string $inputPath, array $config): void
+    {
+        $resolved = $this->resolveInputPath($inputPath);
+        fwrite(STDOUT, sprintf("[upload] %s\n", $resolved));
+        $upload = $client->uploadFile($resolved);
+
+        fwrite(STDOUT, sprintf("[queue]  %s -> video/%s\n", basename($resolved), $config['operation']));
+        $job = $client->startToolJob('/tools/video', [
+            'operation' => $config['operation'],
+            'fileId' => $upload['fileId'] ?? null,
+            'inputKey' => $upload['inputKey'] ?? null,
+            'originalName' => basename($resolved),
+            'params' => $this->buildVideoParams($config),
+        ]);
+        $this->downloadCompletedJob($client, $resolved, $config, $job);
+    }
+
+    private function adaOne(DopplrHubHttpClient $client, string $inputPath, array $config): void
+    {
+        $resolved = $this->resolveInputPath($inputPath);
+        fwrite(STDOUT, sprintf("[upload] %s\n", $resolved));
+        $upload = $client->uploadFile($resolved);
+
+        fwrite(STDOUT, sprintf("[analyze] %s -> ADA report\n", basename($resolved)));
+        $result = $client->analyzeAda($upload, basename($resolved), $config['contentType']);
+        $this->downloadImmediateResult($client, $resolved, $config, $result, 'reportDownloadUrl');
+    }
+
+    private function atsOne(DopplrHubHttpClient $client, string $inputPath, array $config): void
+    {
+        $resolved = $this->resolveInputPath($inputPath);
+        fwrite(STDOUT, sprintf("[upload] %s\n", $resolved));
+        $upload = $client->uploadFile($resolved);
+
+        fwrite(STDOUT, sprintf("[analyze] %s -> ATS report\n", basename($resolved)));
+        $result = $client->analyzeAts(
+            $upload,
+            $config['jobDescription'],
+            basename($resolved),
+            $config['contentType'],
+            $config['industry'],
+            $config['templateId']
+        );
+        $this->downloadImmediateResult($client, $resolved, $config, $result, 'optimizedResumeDownloadUrl');
+    }
+
+    private function downloadCompletedJob(DopplrHubHttpClient $client, string $resolved, array $config, array $job): void
+    {
+        $jobId = (string) ($job['jobId'] ?? '');
+        if ($jobId === '') {
+            throw new DopplrHubCliException('Conversion response did not include a jobId.');
+        }
+
+        $status = $this->waitForCompletedJob($client, $jobId, $config);
+        $downloadUrl = $status['downloadUrl'] ?? null;
+        if (!is_string($downloadUrl) || $downloadUrl === '') {
+            throw new DopplrHubCliException('Completed job did not include a downloadUrl.');
+        }
+
+        $outputPath = $this->buildOutputPath($resolved, $config, $status);
+        fwrite(STDOUT, sprintf("[save]   %s\n", $outputPath));
+        $client->downloadToFile($downloadUrl, $outputPath);
+
+        if ($config['deleteAfterDownload']) {
+            try {
+                $client->deleteJob($jobId);
+                fwrite(STDOUT, sprintf("[delete] %s\n", $jobId));
+            } catch (Throwable $e) {
+                fwrite(STDERR, sprintf("[warn] Could not delete %s: %s\n", $jobId, $e->getMessage()));
+            }
+        }
+    }
+
+    private function downloadImmediateResult(
+        DopplrHubHttpClient $client,
+        string $resolved,
+        array $config,
+        array $result,
+        string $downloadUrlField
+    ): void {
+        $downloadUrl = $result[$downloadUrlField] ?? null;
+        if (!is_string($downloadUrl) || $downloadUrl === '') {
+            throw new DopplrHubCliException('Response did not include a download URL.');
+        }
+
+        $outputPath = $this->buildOutputPath($resolved, $config, $result);
+        fwrite(STDOUT, sprintf("[save]   %s\n", $outputPath));
+        $client->downloadToFile($downloadUrl, $outputPath);
+    }
+
+    private function waitForCompletedJob(DopplrHubHttpClient $client, string $jobId, array $config): array
+    {
+        $deadline = time() + $config['waitSeconds'];
+
+        while (time() <= $deadline) {
+            $status = $client->getJob($jobId);
+            $state = strtolower((string) ($status['state'] ?? 'queued'));
+            $progress = (int) ($status['progress'] ?? 0);
+            fwrite(STDOUT, sprintf("[poll]   %s state=%s progress=%d%%\n", $jobId, $state, $progress));
+
+            if ($state === 'completed') {
+                return $status;
+            }
+
+            if ($state === 'failed') {
+                $reason = (string) ($status['failedReason'] ?? 'Conversion failed.');
+                throw new DopplrHubCliException($reason);
+            }
+
+            sleep($config['pollSeconds']);
+        }
+
+        throw new DopplrHubCliException('Timed out waiting for the conversion to complete.');
+    }
+
+    private function resolveInputPath(string $inputPath): string
+    {
+        $resolved = realpath($inputPath);
+        if ($resolved === false || !is_file($resolved)) {
+            throw new DopplrHubCliException('Input file not found.');
+        }
+
+        return $resolved;
+    }
+
+    private function parseArguments(array $argv): array
+    {
+        array_shift($argv);
+
+        $tool = 'convert';
+        $knownTools = ['convert', 'ocr', 'pdf', 'image', 'video', 'ada', 'ats'];
+        $targetFormat = null;
+        $operation = null;
+        $apiKey = getenv('DOPPLERHUB_API_KEY') ?: null;
+        $baseUrl = getenv('DOPPLERHUB_BASE_URL') ?: 'https://api.dopplrhub.com/api/v1';
+        $waitSeconds = 900;
+        $pollSeconds = 2;
+        $deleteAfterDownload = false;
+        $params = [];
+        $language = 'eng';
+        $jobDescription = null;
+        $industry = null;
+        $templateId = null;
+        $contentType = null;
+        $inputs = [];
+
+        while (($arg = array_shift($argv)) !== null) {
+            switch ($arg) {
+                case '--tool':
+                    $tool = strtolower((string) (array_shift($argv) ?: $tool));
+                    break;
+                case '-f':
+                case '--format':
+                    $targetFormat = array_shift($argv) ?: null;
+                    break;
+                case '--operation':
+                    $operation = strtolower((string) (array_shift($argv) ?: '')) ?: null;
+                    break;
+                case '--param':
+                    $pair = (string) (array_shift($argv) ?: '');
+                    $parts = explode('=', $pair, 2);
+                    if (count($parts) !== 2 || trim($parts[0]) === '') {
+                        throw new DopplrHubCliException('Use --param key=value.');
+                    }
+                    $params[trim($parts[0])] = $this->parseParamValue($parts[1]);
+                    break;
+                case '--api-key':
+                    $apiKey = array_shift($argv) ?: null;
+                    break;
+                case '--base-url':
+                    $baseUrl = array_shift($argv) ?: $baseUrl;
+                    break;
+                case '--timeout':
+                    $waitSeconds = (int) (array_shift($argv) ?: $waitSeconds);
+                    break;
+                case '--poll':
+                    $pollSeconds = max(1, (int) (array_shift($argv) ?: $pollSeconds));
+                    break;
+                case '--delete':
+                    $deleteAfterDownload = true;
+                    break;
+                case '--language':
+                    $language = (string) (array_shift($argv) ?: $language);
+                    break;
+                case '--job-description':
+                    $jobDescription = array_shift($argv) ?: null;
+                    break;
+                case '--industry':
+                    $industry = array_shift($argv) ?: null;
+                    break;
+                case '--template-id':
+                    $templateId = array_shift($argv) ?: null;
+                    break;
+                case '--content-type':
+                    $contentType = array_shift($argv) ?: null;
+                    break;
+                case '-h':
+                case '--help':
+                    $this->printHelp();
+                    exit(0);
+                default:
+                    if ($inputs === [] && in_array(strtolower($arg), $knownTools, true)) {
+                        $tool = strtolower($arg);
+                        break;
+                    }
+                    foreach ($this->expandInputArgument($arg) as $path) {
+                        $inputs[] = $path;
+                    }
+                    break;
+            }
+        }
+
+        if (!in_array($tool, $knownTools, true)) {
+            throw new DopplrHubCliException('Unsupported tool: ' . $tool);
+        }
+
+        if ($tool === 'convert' && !$targetFormat) {
+            throw new DopplrHubCliException('Missing required -f/--format option.');
+        }
+
+        if ($tool === 'ocr' && !$targetFormat) {
+            $targetFormat = 'ocr-pdf';
+        }
+
+        if (in_array($tool, ['pdf', 'image', 'video'], true) && !$operation) {
+            throw new DopplrHubCliException('Missing required --operation option for ' . $tool . '.');
+        }
+
+        if ($tool === 'ats' && !$jobDescription) {
+            throw new DopplrHubCliException('ATS analysis requires --job-description.');
+        }
+
+        if (!$apiKey) {
+            throw new DopplrHubCliException('Set DOPPLERHUB_API_KEY or pass --api-key.');
+        }
+
+        if ($inputs === []) {
+            throw new DopplrHubCliException('Provide at least one input file.');
+        }
+
+        if ($tool === 'pdf' && $operation === 'merge' && count($inputs) < 2) {
+            throw new DopplrHubCliException('PDF merge requires at least two input files.');
+        }
+
+        return [
+            'tool' => $tool,
+            'targetFormat' => is_string($targetFormat) ? strtolower($targetFormat) : '',
+            'operation' => $operation,
+            'apiKey' => $apiKey,
+            'baseUrl' => rtrim($baseUrl, '/'),
+            'timeoutSeconds' => max($waitSeconds, 30),
+            'waitSeconds' => max($waitSeconds, 30),
+            'pollSeconds' => $pollSeconds,
+            'deleteAfterDownload' => $deleteAfterDownload,
+            'params' => $params,
+            'language' => $language,
+            'jobDescription' => $jobDescription,
+            'industry' => $industry,
+            'templateId' => $templateId,
+            'contentType' => $contentType,
+            'inputs' => array_values(array_unique($inputs)),
+        ];
+    }
+
+    private function parseParamValue(string $value): mixed
+    {
+        $trimmed = trim($value);
+        if ($trimmed === '') {
+            return '';
+        }
+
+        $lower = strtolower($trimmed);
+        if ($lower === 'true') {
+            return true;
+        }
+        if ($lower === 'false') {
+            return false;
+        }
+        if ($lower === 'null') {
+            return null;
+        }
+        if (is_numeric($trimmed)) {
+            return str_contains($trimmed, '.') ? (float) $trimmed : (int) $trimmed;
+        }
+        if (($trimmed[0] === '{' && str_ends_with($trimmed, '}')) || ($trimmed[0] === '[' && str_ends_with($trimmed, ']'))) {
+            $decoded = json_decode($trimmed, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                return $decoded;
+            }
+        }
+
+        return $trimmed;
+    }
+
+    private function expandInputArgument(string $arg): array
+    {
+        $hasWildcard = strpbrk($arg, '*?[]') !== false;
+        if ($hasWildcard) {
+            $matches = glob($arg, GLOB_NOSORT) ?: [];
+            if ($matches !== []) {
+                return $matches;
+            }
+        }
+
+        return [$arg];
+    }
+
+    private function buildOutputPath(string $inputPath, array $config, array $payload = []): string
+    {
+        $directory = dirname($inputPath);
+        $filename = pathinfo($inputPath, PATHINFO_FILENAME);
+        $key = $payload['outputKey'] ?? $payload['reportKey'] ?? $payload['optimizedResumeKey'] ?? null;
+
+        if (is_string($key) && $key !== '') {
+            $extension = pathinfo($key, PATHINFO_EXTENSION) ?: $this->guessExtensionFromConfig($config);
+        } else {
+            $extension = $this->guessExtensionFromConfig($config);
+        }
+
+        return $directory . DIRECTORY_SEPARATOR . $filename . '.' . $extension;
+    }
+
+    private function guessExtensionFromConfig(array $config): string
+    {
+        switch ($config['tool']) {
+            case 'convert':
+            case 'ocr':
+                return $this->guessExtension((string) $config['targetFormat']);
+            case 'pdf':
+                return in_array($config['operation'], ['split', 'extract-images'], true) ? 'zip' : 'pdf';
+            case 'image':
+                return (string) ($config['params']['outputFormat'] ?? 'jpg');
+            case 'video':
+                return (string) ($this->buildVideoParams($config)['outputFormat'] ?? 'mp4');
+            case 'ada':
+                return 'pdf';
+            case 'ats':
+                return 'docx';
+            default:
+                return 'bin';
+        }
+    }
+
+    private function buildVideoParams(array $config): array
+    {
+        $params = $config['params'];
+        if ($config['operation'] === 'crop') {
+            return [
+                'left' => (int) ($params['left'] ?? 0),
+                'top' => (int) ($params['top'] ?? 0),
+                'width' => isset($params['width']) ? (int) $params['width'] : null,
+                'height' => isset($params['height']) ? (int) $params['height'] : null,
+                'outputFormat' => (string) ($params['outputFormat'] ?? 'mp4'),
+            ];
+        }
+
+        return [
+            'outputFormat' => (string) ($params['outputFormat'] ?? 'mp4'),
+            'trim' => array_filter([
+                'enabled' => true,
+                'startTime' => $params['startTime'] ?? 0,
+                'endTime' => $params['endTime'] ?? null,
+            ], static fn ($value) => $value !== null),
+        ];
+    }
+
+    private function guessExtension(string $targetFormat): string
+    {
+        $normalized = strtolower(trim($targetFormat));
+        $parts = explode('-', $normalized);
+        return end($parts) ?: $normalized;
+    }
+
+    private function printHelp(): void
+    {
+        $help = <<<'TXT'
+DopplrHub PHP CLI
+
+Usage:
+  dopplrhub -f jpg input.pdf
+  dopplrhub -f pdf *.txt
+    dopplrhub ocr -f ocr-docx --language eng scan.pdf
+    dopplrhub pdf --operation compress --param quality=screen packet.pdf
+    dopplrhub image --operation resize --param width=1920 --param height=1080 --param fit=cover --param outputFormat=webp hero.png
+    dopplrhub video --operation trim --param startTime=3 --param endTime=12 --param outputFormat=mp4 clip.mp4
+    dopplrhub ada brochure.pdf
+    dopplrhub ats --job-description "Senior PHP engineer with API design experience" resume.pdf
+
+Options:
+    --tool TOOL            Tool to run: convert|ocr|pdf|image|video|ada|ats
+  -f, --format FORMAT   Target format (required)
+    --operation NAME       Operation for pdf/image/video tools
+    --param key=value      Repeatable operation parameter for pdf/image/video
+  --api-key KEY         API key; defaults to DOPPLERHUB_API_KEY
+  --base-url URL        API base URL; defaults to DOPPLERHUB_BASE_URL or https://api.dopplrhub.com/api/v1
+  --timeout SECONDS     Max time to wait for each job; default 900
+  --poll SECONDS        Poll interval; default 2
+  --delete              Delete the remote job after download
+    --language CODE       OCR language; default eng
+    --job-description TXT ATS job description input
+    --industry NAME       ATS industry hint
+    --template-id ID      ATS template override
+    --content-type TYPE   Optional MIME type for ADA or ATS analysis
+  -h, --help            Show this help
+TXT;
+
+        fwrite(STDOUT, $help . PHP_EOL);
+    }
+}
+
+$app = new DopplrHubCliApp();
+exit($app->run($_SERVER['argv']));
