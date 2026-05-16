@@ -4,15 +4,13 @@ A self-contained PHP CLI for the existing DopplrHub public API at `/api/v1`.
 
 ## Install
 
-If your backend exposes the packaged download route, the install flow looks like:
-
 ```bash
-wget --no-check-certificate -O /usr/local/bin/dopplrhub https://your-host.example/api/dopplrhub
-chmod +x /usr/local/bin/dopplrhub
+wget -O /usr/local/bin/dopplerhub https://raw.githubusercontent.com/DopplrHub/php-cli/main/dopplerhub
+chmod +x /usr/local/bin/dopplerhub
 export DOPPLERHUB_API_KEY=YOUR_API_KEY
 ```
 
-The backend route added in this workspace serves the CLI at `/api/dopplrhub`.
+If you run a self-hosted DopplrHub instance, the backend also serves the CLI at `/api/dopplerhub`.
 
 For local development on Windows or Linux, you can also run it directly with PHP:
 
