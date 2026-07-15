@@ -3,11 +3,11 @@
 
 declare(strict_types=1);
 
-final class DopplerHubCliException extends RuntimeException
+final class DopplrHubCliException extends RuntimeException
 {
 }
 
-final class DopplerHubHttpClient
+final class DopplrHubHttpClient
 {
     public function __construct(
         private readonly string $apiKey,
@@ -33,15 +33,35 @@ final class DopplerHubHttpClient
         ]);
     }
 
-    public function startConversion(array $upload, string $targetFormat, ?string $originalName = null): array
-    {
+    /**
+     * Start a conversion job.
+     *
+     * mediaType, detectedFormat and fileSizeBytes are all billing-relevant: the
+     * API prices a job from the source media type and applies size multipliers,
+     * and falls back to treating a job as one minute of audio when mediaType is
+     * absent. Omitting them under-charges document and image conversions, so the
+     * CLI sends them whenever it can work them out.
+     */
+    public function startConversion(
+        array $upload,
+        string $targetFormat,
+        ?string $originalName = null,
+        ?string $mediaType = null,
+        ?string $detectedFormat = null,
+        ?int $fileSizeBytes = null,
+        ?array $conversionSettings = null
+    ): array {
         return $this->requestJson('POST', '/convert', [
-            'json' => [
+            'json' => array_filter([
                 'fileId' => $upload['fileId'] ?? null,
                 'inputKey' => $upload['inputKey'] ?? null,
                 'targetFormat' => $targetFormat,
                 'originalName' => $originalName ?? ($upload['fileName'] ?? 'input.bin'),
-            ],
+                'mediaType' => $mediaType,
+                'detectedFormat' => $detectedFormat,
+                'fileSizeBytes' => $fileSizeBytes,
+                'conversionSettings' => $conversionSettings === [] ? null : $conversionSettings,
+            ], static fn ($value) => $value !== null),
         ]);
     }
 
@@ -116,7 +136,7 @@ final class DopplerHubHttpClient
             CURLOPT_FOLLOWLOCATION => true,
             CURLOPT_TIMEOUT => max($this->timeoutSeconds, 60),
             CURLOPT_FAILONERROR => false,
-            CURLOPT_USERAGENT => 'dopplrhub-php-cli/0.1.0',
+            CURLOPT_USERAGENT => 'dopplrhub-php-cli/0.2.0',
         ]);
 
         $result = curl_exec($ch);
@@ -187,7 +207,7 @@ final class DopplerHubHttpClient
                 }
                 return $length;
             },
-            CURLOPT_USERAGENT => 'dopplrhub-php-cli/0.1.0',
+            CURLOPT_USERAGENT => 'dopplrhub-php-cli/0.2.0',
         ]);
 
         if (isset($options['json'])) {
@@ -217,6 +237,105 @@ final class DopplerHubHttpClient
 
 final class DopplrHubCliApp
 {
+    /**
+     * Source file extension => [mediaType, detectedFormat].
+     *
+     * Mirrors EXTENSION_MAP in backend/src/services/fileValidationService.js.
+     * mediaType describes the *source* media, not the target: jpg -> pdf is an
+     * image job, pdf -> jpg is a document job. Deriving it from the target
+     * instead would mis-price both. Aliases normalize the same way the API does
+     * (htm -> html, jpeg -> jpg, dic -> dcm), so the server sees a format it
+     * recognizes. Unknown extensions map to null and are simply omitted, which
+     * leaves the previous behaviour untouched rather than guessing.
+     */
+    private const SOURCE_MAP = [
+        // archive
+        '7z' => ['archive', '7z'],
+        'bz2' => ['archive', 'bz2'],
+        'gz' => ['archive', 'gz'],
+        'rar' => ['archive', 'rar'],
+        'tar' => ['archive', 'tar'],
+        'tbz2' => ['archive', 'tbz2'],
+        'tgz' => ['archive', 'tgz'],
+        'xz' => ['archive', 'xz'],
+        'zip' => ['archive', 'zip'],
+        // audio
+        'aac' => ['audio', 'aac'],
+        'flac' => ['audio', 'flac'],
+        'm4a' => ['audio', 'm4a'],
+        'mp3' => ['audio', 'mp3'],
+        'oga' => ['audio', 'ogg'],
+        'ogg' => ['audio', 'ogg'],
+        'wav' => ['audio', 'wav'],
+        // video
+        'avi' => ['video', 'avi'],
+        'mov' => ['video', 'mov'],
+        'mp4' => ['video', 'mp4'],
+        'webm' => ['video', 'webm'],
+        // image
+        'avif' => ['image', 'avif'],
+        'bmp' => ['image', 'bmp'],
+        'gif' => ['image', 'gif'],
+        'heic' => ['image', 'heic'],
+        'heif' => ['image', 'heic'],
+        'jpeg' => ['image', 'jpg'],
+        'jpg' => ['image', 'jpg'],
+        'png' => ['image', 'png'],
+        'svg' => ['image', 'svg'],
+        'tif' => ['image', 'tiff'],
+        'tiff' => ['image', 'tiff'],
+        'webp' => ['image', 'webp'],
+        // ebook
+        'azw3' => ['ebook', 'azw3'],
+        'epub' => ['ebook', 'epub'],
+        'fb2' => ['ebook', 'fb2'],
+        'mobi' => ['ebook', 'mobi'],
+        // cad
+        'cad' => ['cad', null],
+        'dwg' => ['cad', 'dwg'],
+        'dxf' => ['cad', 'dxf'],
+        'iges' => ['cad', 'iges'],
+        'igs' => ['cad', 'iges'],
+        'step' => ['cad', 'step'],
+        'stl' => ['cad', 'stl'],
+        'stp' => ['cad', 'step'],
+        // document
+        'csv' => ['document', 'csv'],
+        'doc' => ['document', 'doc'],
+        'docx' => ['document', 'docx'],
+        'htm' => ['document', 'html'],
+        'html' => ['document', 'html'],
+        'md' => ['document', 'md'],
+        'odp' => ['document', 'odp'],
+        'ods' => ['document', 'ods'],
+        'odt' => ['document', 'odt'],
+        'pdf' => ['document', 'pdf'],
+        'ppt' => ['document', 'ppt'],
+        'pptx' => ['document', 'pptx'],
+        'rtf' => ['document', 'rtf'],
+        'txt' => ['document', 'txt'],
+        'xls' => ['document', 'xls'],
+        'xlsx' => ['document', 'xlsx'],
+        // medical
+        'dcm' => ['medical', 'dcm'],
+        'dic' => ['medical', 'dcm'],
+        'dicom' => ['medical', 'dcm'],
+        // font
+        'otf' => ['font', 'otf'],
+        'ttf' => ['font', 'ttf'],
+        'woff' => ['font', 'woff'],
+        'woff2' => ['font', 'woff2'],
+    ];
+
+    /**
+     * @return array{0: ?string, 1: ?string} [mediaType, detectedFormat]
+     */
+    private function detectSource(string $path): array
+    {
+        $extension = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        return self::SOURCE_MAP[$extension] ?? [null, null];
+    }
+
     public function run(array $argv): int
     {
         try {
@@ -292,8 +411,20 @@ final class DopplrHubCliApp
         fwrite(STDOUT, sprintf("[upload] %s\n", $resolved));
         $upload = $client->uploadFile($resolved);
 
+        [$detectedMediaType, $detectedFormat] = $this->detectSource($resolved);
+        $mediaType = $config['mediaType'] ?? $detectedMediaType;
+        $fileSizeBytes = filesize($resolved);
+
         fwrite(STDOUT, sprintf("[queue]  %s -> %s\n", basename($resolved), $config['targetFormat']));
-        $job = $client->startConversion($upload, $config['targetFormat'], basename($resolved));
+        $job = $client->startConversion(
+            $upload,
+            $config['targetFormat'],
+            basename($resolved),
+            $mediaType,
+            $detectedFormat,
+            $fileSizeBytes === false ? null : $fileSizeBytes,
+            $config['conversionSettings']
+        );
         $this->downloadCompletedJob($client, $resolved, $config, $job);
     }
 
@@ -511,6 +642,8 @@ final class DopplrHubCliApp
         $pollSeconds = 2;
         $deleteAfterDownload = false;
         $params = [];
+        $conversionSettings = [];
+        $mediaType = null;
         $language = 'eng';
         $jobDescription = null;
         $industry = null;
@@ -537,6 +670,17 @@ final class DopplrHubCliApp
                         throw new DopplrHubCliException('Use --param key=value.');
                     }
                     $params[trim($parts[0])] = $this->parseParamValue($parts[1]);
+                    break;
+                case '--setting':
+                    $pair = (string) (array_shift($argv) ?: '');
+                    $parts = explode('=', $pair, 2);
+                    if (count($parts) !== 2 || trim($parts[0]) === '') {
+                        throw new DopplrHubCliException('Use --setting key=value.');
+                    }
+                    $conversionSettings[trim($parts[0])] = $this->parseParamValue($parts[1]);
+                    break;
+                case '--media-type':
+                    $mediaType = strtolower((string) (array_shift($argv) ?: '')) ?: null;
                     break;
                 case '--api-key':
                     $apiKey = array_shift($argv) ?: null;
@@ -627,6 +771,8 @@ final class DopplrHubCliApp
             'pollSeconds' => $pollSeconds,
             'deleteAfterDownload' => $deleteAfterDownload,
             'params' => $params,
+            'conversionSettings' => $conversionSettings === [] ? null : $conversionSettings,
+            'mediaType' => $mediaType,
             'language' => $language,
             'jobDescription' => $jobDescription,
             'industry' => $industry,
@@ -753,6 +899,8 @@ DopplrHub PHP CLI
 Usage:
   dopplrhub -f jpg input.pdf
   dopplrhub -f pdf *.txt
+    dopplrhub -f json invoice.pdf
+    dopplrhub -f json --setting json='{"schema":{"fields":[{"property":"totalDue","match":"Total Due","type":"number"}]}}' invoice.pdf
     dopplrhub ocr -f ocr-docx --language eng scan.pdf
     dopplrhub pdf --operation compress --param quality=screen packet.pdf
     dopplrhub image --operation resize --param width=1920 --param height=1080 --param fit=cover --param outputFormat=webp hero.png
@@ -765,6 +913,9 @@ Options:
   -f, --format FORMAT   Target format (required)
     --operation NAME       Operation for pdf/image/video tools
     --param key=value      Repeatable operation parameter for pdf/image/video
+    --setting key=value    Repeatable conversionSettings entry for convert; value may be JSON
+    --media-type TYPE      Override the detected source media type (audio|video|document|image|
+                           archive|ebook|font|medical|cad). Detected from the file extension by default.
   --api-key KEY         API key; defaults to DOPPLERHUB_API_KEY
   --base-url URL        API base URL; defaults to DOPPLERHUB_BASE_URL or https://api.dopplrhub.com/api/v1
   --timeout SECONDS     Max time to wait for each job; default 900
